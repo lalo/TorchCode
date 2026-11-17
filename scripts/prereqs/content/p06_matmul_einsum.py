@@ -67,6 +67,14 @@ Getting them right is mostly about **shape bookkeeping**: which dims are batch d
 
 `nn.Linear(in_features, out_features)` stores its weight as **`(out_features, in_features)`**, so its forward pass is `x @ W.T + b`.
 `x` can have any number of leading dims: `(N, in)`, `(B, S, in)`, … The matmul contracts the **last** dim of `x` with the **last** dim of `W`.
+
+**Why the transpose?** `@` always pairs the **last** dim of the left operand with the **second-to-last** dim of the right one: it takes dot products of the left's **rows** with the right's **columns**. Each **row** of `W` holds the `in` weights of one output feature, so `W.T` turns those rows into columns:
+
+```text
+x:      (2, 5, 4)
+W.T:          (4, 3)      the 4s meet and are summed over
+result: (2, 5, 3)         without .T it would be (5, 4) @ (3, 4): an error
+```
 '''),
         ("code", r'''
 lin = torch.nn.Linear(4, 3)
@@ -83,7 +91,13 @@ print(torch.allclose(lin(x), x @ lin.weight.T + lin.bias, atol=1e-6))
 | `torch.bmm(a, b)` | exactly 3-D, same batch | `(B, n, k) @ (B, k, m)` |
 | `a @ b` / `torch.matmul` | any dims ≥ 1 | leading dims **broadcast**: `(B, H, n, k) @ (B, H, k, m)` or even `(B, H, n, k) @ (k, m)` |
 
-`@` is the safe default. `bmm` is fine when you know you have exactly 3-D tensors.
+The rule for `@` when both sides are at least 2-D: the **last two** dims are the matrices, and everything in front is a batch of them.
+
+```text
+(..., n, k) @ (..., k, m) -> (..., n, m)        the leading ... must match or broadcast
+```
+
+`@` is the safe default. `bmm` ("batch matrix multiply": `c[i] = a[i] @ b[i]`) does the same job for 3-D inputs. It isn't faster; it's a **stricter contract**: exactly 3-D, equal batch sizes, no broadcasting. Use it when you want a wrong shape to fail instead of broadcasting.
 '''),
         ("code", r'''
 a = torch.randn(2, 3, 5, 4)      # (B, H, n, k)
@@ -99,13 +113,21 @@ except RuntimeError as e:
 ## 3. Transpose the last two dims
 
 To compare every query with every key you need `Q @ Kᵀ` over the **last two** dims only.
-`K.T` is wrong for batched tensors: it reverses **all** dims. Use `K.transpose(-2, -1)` (or `K.mT`).
+`K.T` is wrong for batched tensors: it reverses **all** dims (newer PyTorch versions warn that this use is deprecated). Use `K.transpose(-2, -1)` (or `K.mT`, the "matrix transpose": the same swap of the last two dims).
+
+**Why transpose `K` and not `Q`?** Nothing makes `K` special. `Q` and `K` both store one token per **row**, and we want the dot product of every query row with every key row. `@` dots left **rows** with right **columns**, so one of them has to become columns:
+
+- `Q @ Kᵀ` gives `(S_q, S_k)`: one row per query. This is the layout attention uses.
+- `K @ Qᵀ` gives the same scores, transposed: `(S_k, S_q)`.
+- `Qᵀ @ K` is a **different** computation: `(d, d)`, comparing **features** and summing over tokens.
 '''),
         ("code", r'''
 Q = torch.randn(2, 5, 8)         # (B, S_q, d)
 K = torch.randn(2, 7, 8)         # (B, S_k, d)
 print(K.transpose(-2, -1).shape) # (2, 8, 7)
 print((Q @ K.transpose(-2, -1)).shape)   # (2, 5, 7): one score per (query, key)
+print(K.mT.shape, K.T.shape)             # (2, 8, 7) vs (8, 7, 2): .T reverses ALL dims (and warns)
+print(torch.allclose((K @ Q.mT).mT, Q @ K.mT, atol=1e-6))   # same scores, transposed layout
 '''),
         ("md", r'''
 ## 4. `einsum`
@@ -119,6 +141,12 @@ Give every dim a letter. Letters in the inputs that are **missing from the outpu
 | `"bhqd,bhkd->bhqk"` | attention scores per head, without any transpose |
 | `"i,j->ij"` | outer product |
 | `"ii->"` | trace |
+
+**How the attention row works without a transpose.** `@` has a fixed rule (last dim meets second-to-last), but `einsum` pairs dims **by letter**. In `"bhqd,bhkd->bhqk"`, both inputs share `d`, and `d` is missing from the output, so it is multiplied and summed: `scores[b, h, q, k] = (Q[b, h, q, :] * K[b, h, k, :]).sum()`. The output's last dim `k` indexes **which key**, not the features inside it; those were summed away.
+
+**Picking letters:** any letters work. Choose memory aids (`b` batch, `o` out-channel, …), write one letter per dim **in the tensor's existing order**, and give dims that correspond across inputs the **same** letter.
+
+**Trace:** the sum of the main diagonal, `A[0, 0] + A[1, 1] + …`. Repeating `i` within one input (`"ii"`) picks the diagonal, and the empty output sums it.
 '''),
         ("code", r'''
 Q = torch.randn(2, 3, 5, 8)      # (b, h, q, d)
@@ -126,6 +154,9 @@ K = torch.randn(2, 3, 7, 8)      # (b, h, k, d)
 s1 = torch.einsum("bhqd,bhkd->bhqk", Q, K)
 s2 = Q @ K.transpose(-2, -1)
 print(s1.shape, torch.allclose(s1, s2, atol=1e-5))
+
+A = torch.arange(1., 10.).view(3, 3)
+print(torch.einsum("ii->", A), torch.trace(A))   # 1 + 5 + 9 = 15, both ways
 '''),
         ("md", r'''
 ## 5. Associativity and cost
@@ -136,6 +167,19 @@ With `Q, K, V` of shape `(S, d)`:
 - `Q @ (Kᵀ @ V)` builds a `(d, d)` matrix: about `2·S·d²`. For long sequences (`S ≫ d`) this is far cheaper.
 
 That is the core idea of linear attention (#12). LoRA (#26) uses the same trick: `(x @ Aᵀ) @ Bᵀ` never forms the large `B @ A`.
+
+**Why it matters even though `Q`, `K` and `V` are the same shape:** their names and values don't matter here. After the transpose, the three operands are `(S, d)`, `(d, S)`, `(S, d)`, in that order, and the order stays fixed. Only the **parentheses** move, and they decide which **intermediate** gets built:
+
+```text
+(Q @ Kᵀ) @ V:  (S, d) @ (d, S) -> (S, S)  huge, then (S, S) @ (S, d)
+Q @ (Kᵀ @ V):  (d, S) @ (S, d) -> (d, d)  tiny, then (S, d) @ (d, d)
+```
+
+Multiplying `(n, k) @ (k, m)` costs about `n·k·m` multiply-adds: each of the `n·m` outputs needs `k` of them.
+
+- You can move **parentheses**, but not transposes: `Qᵀ @ K` computes something else (§3).
+- With a **softmax** between the two products, as in standard attention, you can't regroup at all.
+- A single `einsum` over three operands states the **result**, not the order. PyTorch picks the order itself (left to right, unless the optional `opt_einsum` package is installed). Two calls guarantee which product happens first.
 '''),
         ("code", r'''
 import time
@@ -266,8 +310,10 @@ print(attention_scores(Q, K).shape)   # expect torch.Size([2, 3, 5, 7])
 #22 Conv2d extracts every `kH × kW` patch with `unfold`. The convolution is then a single contraction. Write it with `torch.einsum`.
 
 - `patches`: `(B, C_in, H_out, W_out, kH, kW)`, where `patches[b, c, h, w]` is the input patch at output position `(h, w)`
-- `weight`: `(C_out, C_in, kH, kW)`
-- returns: `(B, C_out, H_out, W_out)` with `out[b, o, h, w] = sum over c, i, j of patches[b, c, h, w, i, j] * weight[o, c, i, j]`
+- `weight`: `(C_out, C_in, kH, kW)`: **one filter per output channel**, and each filter spans **every** input channel
+- returns: `(B, C_out, H_out, W_out)`, where `out[b, o, h, w]` is the patch at output position `(h, w)` multiplied element-wise by filter `o` and summed over everything the two have in common (input channels and kernel positions)
+
+*Work out which dims of `patches` and `weight` correspond, give them the same letters, and decide which letters survive into the output.*
 ''',
             "stub": r'''
 def patch_conv(patches: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -321,8 +367,8 @@ A LoRA layer adds a low-rank update to a frozen weight: `y = x Wᵀ + scaling ·
 Compute it **without forming `B @ A`**, which would be a full `(out, in)` matrix. Go through the rank-`r` bottleneck instead: `(x @ Aᵀ) @ Bᵀ`.
 
 - `x`: `(..., in)`
-- `W`: `(out, in)`, the frozen base weight
-- `A`: `(r, in)`, `B`: `(out, r)`
+- `W`: `(out, in)`, the frozen base weight (not trained)
+- `A`: `(r, in)`, `B`: `(out, r)`: the two small **LoRA** weights, the only ones trained. `A` projects the input down to rank `r`; `B` projects back up to `out`
 - `scaling`: float
 - returns: `(..., out)`
 ''',
