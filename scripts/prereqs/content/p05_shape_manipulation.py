@@ -69,6 +69,9 @@ In practice, most attention bugs are shape bugs.
 ## 1. `view` vs `reshape` and contiguity
 
 A tensor is a flat block of memory plus **strides** that say how far to jump for each dimension.
+
+**Reading a stride:** for `x = arange(6).view(2, 3)`, the stride is `(3, 1)`. One step **down** a row jumps 3 places in memory (`0 → 3`), and one step **right** jumps 1 (`0 → 1`). So `x[i, j]` lives at memory position `i * 3 + j * 1`. After `x.T` the stride is `(1, 3)`: the same memory, read with the steps swapped.
+
 - `view` only re-interprets the strides. It never copies data, so it **fails** if the memory layout doesn't allow the new shape.
 - `transpose` / `permute` just swap strides. The result is usually **non-contiguous**.
 - `reshape` = `view` if possible, otherwise copy. `.contiguous()` forces a copy into the standard layout.
@@ -76,6 +79,8 @@ A tensor is a flat block of memory plus **strides** that say how far to jump for
         ("code", r'''
 x = torch.arange(6).view(2, 3)
 print(x, x.stride(), x.is_contiguous())
+i, j = 1, 2
+print(x[i, j], x.flatten()[i * 3 + j * 1])  # both 5: memory position = i * stride[0] + j * stride[1]
 
 xt = x.transpose(0, 1)                       # (3, 2)
 print(xt, xt.stride(), xt.is_contiguous())   # strides swapped, not contiguous
@@ -132,6 +137,8 @@ All three only change the shape: they return views and never lose or copy values
 - **`squeeze(dim)`** removes `dim` only if its size is **1**. If the size isn't 1, it **silently does nothing** (no error); an out-of-range `dim` does raise.
 - **`squeeze()`** with no argument removes **every** size-1 dimension, including a batch dimension that happens to be 1 (a single example at inference time). That's a classic shape bug, so prefer `squeeze(dim)`.
 - **`unsqueeze(dim)`** is the inverse: it inserts a size-1 dimension at `dim`.
+
+> ⚠️ None of the shape ops in this notebook (`view`, `reshape`, `transpose`, `permute`, `flatten`, `squeeze`, …) change `x` itself. They **return** a new tensor. A line like `x.flatten(1)` on its own does nothing; write `x = x.flatten(1)` or `return x.flatten(1)`.
 '''),
         ("code", r'''
 x = torch.randn(3, 1, 4)
@@ -144,12 +151,23 @@ print(torch.zeros(2, 3).squeeze(0).shape)     # (2, 3): dim 0 has size 2, silent
 one = torch.randn(1, 5, 1)                    # a batch of ONE sequence: (B=1, S=5, 1)
 print(one.squeeze().shape)                    # (5,): the batch dim is gone too!
 print(one.squeeze(-1).shape)                  # (1, 5): only the dim you meant
+
+y = torch.randn(2, 3, 4)
+y.flatten(1)                                  # result thrown away
+print(y.shape)                                # still (2, 3, 4)
+y = y.flatten(1)
+print(y.shape)                                # (2, 12)
 '''),
         ("md", r'''
 ## 4. `cat` vs `stack`
 
 - `cat` joins along an **existing** dim. Shapes must match everywhere else.
 - `stack` creates a **new** dim. All shapes must match exactly.
+
+The new dim of `stack` answers **"which input did this come from?"**, and `dim` decides where that question goes. Stacking `a = [1, 2, 3]` and `b = [10, 20, 30]`:
+
+- `dim=0` gives shape `(2, 3)`, indexed `s[input, position]`: one row per input
+- `dim=-1` gives shape `(3, 2)`, indexed `s[position, input]`: one row per **position**, holding `a`'s and `b`'s value side by side
 
 *#14 KV Cache appends new keys with `cat` along the sequence dim.*
 '''),
@@ -159,6 +177,10 @@ print(torch.cat([a, b], dim=0).shape)    # (4, 3)
 print(torch.cat([a, b], dim=1).shape)    # (2, 6)
 print(torch.stack([a, b], dim=0).shape)  # (2, 2, 3)
 print(torch.stack([a, b], dim=-1).shape) # (2, 3, 2)
+
+a, b = torch.tensor([1, 2, 3]), torch.tensor([10, 20, 30])
+print(torch.stack([a, b], dim=0))        # [[1, 2, 3], [10, 20, 30]]:   s[input, position]
+print(torch.stack([a, b], dim=-1))       # [[1, 10], [2, 20], [3, 30]]: s[position, input]
 '''),
         ("md", r'''
 ## 5. `repeat_interleave` vs `repeat`
@@ -175,26 +197,54 @@ print(x.repeat(2))              # [1, 2, 3, 1, 2, 3]: the whole tensor tiled
 
 `x.unfold(dim, size, step)` returns a **view** containing every window of length `size` along `dim`, taken every `step` elements. The windows become a **new last dim**.
 Unfold dim 2 and then dim 3 of an image `(B, C, H, W)` to get every `k × k` patch: `(B, C, H_out, W_out, k, k)`.
+Each `unfold` **replaces** the dim you name with the **number of windows**, and **appends** the window size at the end:
+
+```text
+(B, C, H, W)  --unfold(2, k, s)-->  (B, C, H_out, W, k)  --unfold(3, k, s)-->  (B, C, H_out, W_out, k, k)
+```
 
 The number of windows along a dim of size `H`, with padding `p` and stride `s`:
 
 $$H_{out} = \left\lfloor \frac{H + 2p - k}{s} \right\rfloor + 1$$
 
 `F.pad(x, (left, right, top, bottom))` pads the **last** dims first: the first pair pads the last dim, the second pair the one before it.
+
+**Padding is optional.** It **adds** a border (zeros by default); it never drops anything. `unfold` only takes windows that fit **entirely** inside the tensor. On a `3 × 3` image a `3 × 3` window fits once, centered on the middle pixel. The edge pixels are still *in* that window, but no window is *centered* on them, because that would need values outside the image:
+
+```text
+no padding: 1 window          padding 1: 9 windows, e.g. centered on pixel 1
+                              0 0 0 0 0
+  1 2 3                       0 1 2 3 0      window:  0 0 0
+  4 5 6   <- centered on 5    0 4 5 6 0               0 1 2
+  7 8 9                       0 7 8 9 0               0 4 5
+                              0 0 0 0 0
+```
+
+How much to pad depends on what you want:
+- **same output size** at stride 1 (a convolution that keeps `H × W`): `(k - 1) // 2` on every side, so `1` for `k = 3`, `2` for `k = 5`
+- **non-overlapping patches** (`step = k`, as in ViT): none, when `H` and `W` divide by `k`; otherwise `unfold` silently drops the leftover pixels at the right and bottom, unless you pad only those sides, e.g. `F.pad(x, (0, 1, 0, 1))` for `5 × 5` → `6 × 6` with `k = 3`
 '''),
         ("code", r'''
 x = torch.arange(16.).view(1, 1, 4, 4)
+print(x.unfold(2, 2, 2).shape)             # (1, 1, 2, 4, 2): H -> 2 windows, window rows appended
 w = x.unfold(2, 2, 2).unfold(3, 2, 2)      # 2x2 windows, stride 2
-print(w.shape)                             # (1, 1, 2, 2, 2, 2)
+print(w.shape)                             # (1, 1, 2, 2, 2, 2): then W -> 2 windows, window cols appended
 print(w[0, 0, 0, 1])                       # top-right window: [[2, 3], [6, 7]]
 print(F.pad(x, (1, 1, 1, 1)).shape)        # (1, 1, 6, 6): one zero on every side
 print(x.unfold(3, 3, 1).shape)             # 1-D windows along W: (1, 1, 4, 2, 3)
+
+img = torch.arange(1., 10.).view(1, 1, 3, 3)
+print(img.unfold(2, 3, 1).unfold(3, 3, 1).shape)              # (1, 1, 1, 1, 3, 3): one window
+padded = F.pad(img, (1, 1, 1, 1))
+print(padded.unfold(2, 3, 1).unfold(3, 3, 1).shape)           # (1, 1, 3, 3, 3, 3): one per pixel
+print(padded.unfold(2, 3, 1).unfold(3, 3, 1)[0, 0, 0, 0])     # centered on pixel 1: [[0,0,0],[0,1,2],[0,4,5]]
 '''),
         ("md", r'''
 ## 7. `expand` vs `repeat`, and other helpers
 
 - **`x.expand(*sizes)`** broadcasts size-1 dims **without copying**: the new dims get stride `0`, so every "copy" reads the same memory. **`x.repeat(*reps)`** really copies. Use `expand` when you only read the result; never write into an expanded tensor.
-- **`x.unflatten(dim, sizes)`** is the readable inverse of `flatten`: `x.unflatten(-1, (H, d))` splits the model dim into heads.
+- Their arguments mean different things. **`expand` takes the final shape** ("what size?"); **`repeat` takes how many times to tile each dim** ("how many times?"). For `x` of shape `(3, 1)`, `x.expand(3, 4)` and `x.repeat(1, 4)` are both `(3, 4)`, but `x.repeat(3, 4)` is `(9, 4)`. `expand` can only grow size-1 dims; `repeat` can tile any dim.
+- **`x.unflatten(dim, sizes)`** is the readable inverse of `flatten`: it splits **one** dim into several, and you don't have to name the others. Use it when one dim really holds groups: `(B, S, D).unflatten(-1, (H, d))` splits the model dim into heads, and `(B, 784).unflatten(-1, (28, 28))` turns flat pixels back into an image. It doesn't discover structure; you tell it how to read the dim, and the sizes must multiply to its size.
 - **`x.movedim(src, dst)`** moves one dim to a new position; `swapaxes` / `transpose` swap two.
 - **`torch.roll(x, shifts, dims)`** shifts elements cyclically (wrapping around the end).
 - **`*_as` helpers** take the shape from another tensor: `view_as(y)`, `reshape_as(y)`, `expand_as(y)`.
@@ -203,6 +253,7 @@ print(x.unfold(3, 3, 1).shape)             # 1-D windows along W: (1, 1, 4, 2, 3
 x = torch.arange(3.).view(3, 1)
 e = x.expand(3, 4)
 r = x.repeat(1, 4)
+print(e.shape, r.shape, x.repeat(3, 4).shape)     # (3, 4) (3, 4) (9, 4): repeat counts, not sizes
 print(e.stride(), e.data_ptr() == x.data_ptr())   # (1, 0) True: no copy
 print(r.stride(), r.data_ptr() == x.data_ptr())   # (4, 1) False: a real copy
 
@@ -344,6 +395,8 @@ Merge two tensors along the last dim, alternating elements: `[a0, b0, a1, b1, ..
 - returns: `(..., 2N)`
 
 *RoPE rotates pairs `(x[2k], x[2k+1])` and then has to put the rotated halves back in interleaved order.*
+
+*Hint: `scatter` into odd positions works, but there is a shorter way. Think of a tensor where `[..., i, 0]` is `a[i]` and `[..., i, 1]` is `b[i]` (§4), then read it in row-major order (§1).*
 ''',
             "stub": r'''
 def interleave(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -372,7 +425,7 @@ Cut images into non-overlapping `p × p` patches and flatten each patch into a v
 - **Patch order:** row-major over the patch grid (left→right, then top→bottom)
 - **Within a patch:** flatten in `(C, p_row, p_col)` order, i.e. `out[b, n] == img[b, :, r*p:(r+1)*p, c*p:(c+1)*p].flatten()` for patch `n = r * (W/p) + c`
 
-*Hint: `reshape` to 6 dims, `permute`, `reshape` back.*
+*Hint: `reshape` to 6 dims, `permute`, `reshape` back. (`unfold` twice, from §6, also gets you the 6 dims.)*
 ''',
             "stub": r'''
 def patchify(img: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -388,15 +441,18 @@ def patchify(img: torch.Tensor, patch_size: int) -> torch.Tensor:
     return x.reshape(B, n_h * n_w, C * p * p)
 ''',
             "debug": r'''
-img = torch.arange(1 * 1 * 4 * 4).float().view(1, 1, 4, 4)
+img = torch.arange(1 * 1 * 4 * 6).float().view(1, 1, 4, 6)   # (B, C, H, W) = (1, 1, 4, 6)
 print(img[0, 0])
 patches = patchify(img, 2)
-print(patches.shape)   # expect torch.Size([1, 4, 4])
+print(patches.shape)   # expect torch.Size([1, 6, 4]): (B, N, C*p*p), a 2 x 3 grid of 2x2 patches
 print(patches[0])
-# expect [[ 0,  1,  4,  5],   top-left
-#         [ 2,  3,  6,  7],   top-right
-#         [ 8,  9, 12, 13],   bottom-left
-#         [10, 11, 14, 15]]   bottom-right
+# expect [[ 0,  1,  6,  7],   top row of patches, left to right
+#         [ 2,  3,  8,  9],
+#         [ 4,  5, 10, 11],
+#         [12, 13, 18, 19],   bottom row
+#         [14, 15, 20, 21],
+#         [16, 17, 22, 23]]
+# Each row is one patch: 2 pixels from one image row, then the 2 below them.
 ''',
         },
         {
