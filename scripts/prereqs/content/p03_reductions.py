@@ -58,6 +58,8 @@ Two choices decide whether that works: **which `dim`** you reduce over, and whet
 
 For a `(B, N)` tensor, `x.sum(dim=-1)` adds **along** the last dim, giving one number per row: shape `(B,)`.
 `x.sum(dim=0)` adds down the columns, giving one number per column: shape `(N,)`.
+
+The `dim=` argument names an axis by its **position** (`0`, `1`, …, or `-1` for the last), not by what it holds. In a `(batch, seq, dim)` tensor, `.sum(dim=1)` sums over the **sequence** axis. It has nothing to do with the feature size that people also call `dim` or `D`.
 '''),
         ("code", r'''
 x = torch.tensor([[1., 2., 3.],
@@ -71,13 +73,30 @@ print(x.sum())         # tensor(21.)            everything -> 0-d tensor
 
 Without `keepdim`, a `(B, N)` → `(B,)` result can't be subtracted from `x` row-wise. Broadcasting aligns from the **right**, so `(B,)` lines up with `N`.
 With `keepdim=True` you get `(B, 1)`, which broadcasts correctly. *(See P2 Broadcasting.)*
+
+Both lines below give a `(3, 3)` result, so **the shape won't warn you**. What changes is *which* number gets subtracted where. Say the row means are `[10, 20, 30]`:
+
+- shape `(3,)` broadcasts as a **row**, `[[10, 20, 30], [10, 20, 30], [10, 20, 30]]`: each **column** gets a different number subtracted, even though they are row means
+- shape `(3, 1)` broadcasts as a **column**, `[[10, 10, 10], [20, 20, 20], [30, 30, 30]]`: each row gets its own mean
+
+The square shape is what hides the bug. With a `(3, 4)` tensor, the version without `keepdim` raises an error. Don't count on that error, though: whenever the sizes happen to match (or one of them is 1), the wrong version runs silently. **Keep the reduced dim whenever you combine a statistic with the tensor it came from.**
 '''),
         ("code", r'''
 x = torch.randn(3, 3)
+print(x.mean(dim=-1).shape)                # torch.Size([3]):    lines up with the LAST dim (columns)
+print(x.mean(dim=-1, keepdim=True).shape)  # torch.Size([3, 1]): one value per row, stretched across it
 wrong = x - x.mean(dim=-1)                 # (3,3) - (3,) -> subtracts per COLUMN, silently!
 right = x - x.mean(dim=-1, keepdim=True)   # (3,3) - (3,1) -> per row
+print(wrong.shape, right.shape)            # both torch.Size([3, 3]): the shape can't tell them apart
 print(right.mean(dim=-1))                  # ~0 for every row
 print(wrong.mean(dim=-1))                  # not 0
+
+y = torch.randn(3, 4)                      # not square: now the mistake is loud
+try:
+    y - y.mean(dim=-1)                     # (3,4) - (3,): trailing sizes 4 and 3 don't match
+except RuntimeError as e:
+    print("error:", str(e)[:60])
+print((y - y.mean(dim=-1, keepdim=True)).shape)   # (3,4) - (3,1) -> torch.Size([3, 4])
 '''),
         ("md", r'''
 ## 3. `max` returns values *and* indices
@@ -98,12 +117,15 @@ print(x.amax(dim=-1), x.argmax(dim=-1))
 `x.var()` and `x.std()` divide by `N - 1` by default (the *unbiased* sample estimate).
 **Normalization layers divide by `N`**: LayerNorm, BatchNorm's normalization, and RMSNorm. Pass `unbiased=False` (or `correction=0`).
 With small `N` the difference is large; tests will catch it.
+
+*Why `N - 1`?* The mean was computed from the same values, so they sit a little closer to it than to the true mean of whatever they were sampled from. Dividing by `N` therefore underestimates the spread on average, and `N - 1` corrects exactly that. This matters when you **estimate** a larger population from a sample. A normalization layer only **describes** the values in front of it, so it divides by `N`.
 '''),
         ("code", r'''
 x = torch.tensor([1., 2., 3., 4.])
 print(x.var())                    # 1.6667  divides by N-1 = 3
 print(x.var(unbiased=False))      # 1.25    divides by N   = 4
-print(((x - x.mean()) ** 2).mean())   # 1.25, the definition
+print(((x - x.mean()) ** 2).mean())   # 1.25: the definition, the average squared distance
+                                      # from the mean. This is what unbiased=False computes.
 '''),
         ("md", r'''
 ## 5. Several dims at once
@@ -120,12 +142,17 @@ print(x.amax(dim=(-2, -1), keepdim=True).shape)     # torch.Size([8, 3, 1, 1])
 
 `x.norm()` is the L2 norm of **all** elements: `sqrt(sum(x**2))`. `x.norm(dim=-1)` gives one norm per row.
 To reduce across a **list** of differently-shaped tensors (like every parameter's gradient), reduce each one to a scalar, then combine the scalars. Never concatenate everything into one huge tensor.
+
+The concatenated version below still shows what the number **means**. `flatten()` turns each tensor into a 1-D vector, and `cat` joins vectors of different lengths end to end (unlike `stack`, which needs equal shapes). For the norm, it doesn't matter which tensor a value came from: it is the square root of the sum of **every** value squared.
+
+*What it's for:* it measures how big the gradients are **all together**. Gradient clipping (#21) uses it: if the total norm is `100` and the limit is `5`, multiply **every** gradient by `5 / 100`. The step gets smaller, and its direction stays the same.
 '''),
         ("code", r'''
 grads = [torch.randn(4, 4), torch.randn(10)]
 per_tensor = torch.stack([g.pow(2).sum() for g in grads])  # one scalar each
 print(per_tensor.sum().sqrt())
 print(torch.cat([g.flatten() for g in grads]).norm())      # same value, but copies everything
+                                                           # (16,) and (10,) -> one (26,) vector
 '''),
         ("md", r'''
 ## 7. Cumulative sums
@@ -148,9 +175,12 @@ print((p.cumsum(dim=0) - p) < 0.7)           # keep [True, True, False, False]: 
 |------|-----|------|
 | mean **and** std/var together | `torch.std_mean(x, dim, correction=0)`, `torch.var_mean(...)` | one call, one pass |
 | median / percentiles | `x.median(dim)`, `torch.quantile(x, q, dim)` | `median` returns the **lower** of the two middle values for even counts; `quantile` interpolates |
+| add numbers stored as logs | `torch.logsumexp(x, dim)` | `log(sum(exp(x)))` without overflow; the softmax denominator |
 | running log-sum-exp | `torch.logcumsumexp(x, dim)` | the stable log of `cumsum(exp(x))` |
 | count matches | `torch.count_nonzero(x > 0, dim)` | no float conversion needed |
 | "are these equal?" | `torch.allclose(a, b)`, `torch.isclose(a, b)` (element-wise), `torch.isfinite(x).all()` | never compare floats with `==` |
+
+*Why `logsumexp`?* Probabilities are often stored as **logs**, because multiplying many small probabilities underflows to 0 while adding their logs doesn't. Adding two logs, though, **multiplies** the probabilities: `log(0.2) + log(0.3) = log(0.06)`. To **add** them you go back with `exp`, sum, and return with `log`: `log(exp(log 0.2) + exp(log 0.3)) = log(0.5)`. `torch.logsumexp` does those three steps without overflowing. It subtracts the max first, the same trick as Exercise 1.
 '''),
         ("code", r'''
 x = torch.tensor([[1., 2., 3., 10.],
@@ -158,6 +188,10 @@ x = torch.tensor([[1., 2., 3., 10.],
 std, mean = torch.std_mean(x, dim=-1, correction=0)    # correction=0: biased, like unbiased=False
 print(mean, std)
 print(x.median(dim=-1).values, torch.quantile(x, 0.5, dim=-1))   # [2., 4.] vs [2.5, 4.]
+lp = torch.tensor([0.2, 0.3]).log()                               # two log-probabilities
+print(torch.logsumexp(lp, dim=0).exp())                           # tensor(0.5000): their probabilities added
+print(torch.tensor([1000., 1000.]).exp().sum().log())             # inf: the naive way overflows
+print(torch.logsumexp(torch.tensor([1000., 1000.]), dim=0))       # tensor(1000.6932)
 print(torch.logcumsumexp(torch.tensor([1000., 1000.]), dim=0))   # [1000., ~1000.693], no overflow
 print(torch.count_nonzero(x > 3, dim=-1))                         # [1, 4]
 print(0.1 + 0.2 == 0.3, torch.isclose(torch.tensor(0.1 + 0.2), torch.tensor(0.3)))
@@ -282,6 +316,10 @@ Average token vectors over the sequence, counting only the **valid** positions.
 - returns: `(B, D)`, where `out[b] = mean of x[b, s] over valid s`
 - if a sequence has **no** valid positions, return zeros for it (not `NaN`)
 
+The output has no `S` axis because that is the axis you average **over**: one `D`-vector per sequence. In the example below, each innermost pair like `[1., 10.]` is **one token's** feature vector (`D = 2`), not two tokens.
+
+*Hint: zeroing the masked tokens is only half the job. `.mean(dim=1)` still divides by `S`, so the zeros pull the average down. Divide by the number of **valid** tokens instead.*
+
 *#41 OPD averages a per-token loss over unmasked tokens with exactly this pattern.*
 ''',
             "stub": r'''
@@ -296,8 +334,8 @@ def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return total / count
 ''',
             "debug": r'''
-x = torch.tensor([[[1., 10.], [3., 30.], [100., 100.]],
-                  [[5., 50.], [7., 70.], [9., 90.]]])
+x = torch.tensor([[[1., 10.], [3., 30.], [100., 100.]],   # (B=2, S=3, D=2): 2 sequences of 3 tokens,
+                  [[5., 50.], [7., 70.], [9., 90.]]])     # each token a 2-number feature vector
 mask = torch.tensor([[True, True, False],
                      [False, False, False]])
 print(masked_mean(x, mask))
