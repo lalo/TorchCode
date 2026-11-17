@@ -10,5 +10,11 @@
     "solved_at": "2026-11-16T17:04:45.497813",
     "best_time": 0.09135779601638205,
     "attempts": 2
+  },
+  "p03_reductions": {
+    "status": "solved",
+    "solved_at": "2026-11-17T11:00:38.954824",
+    "best_time": 0.08278042002348229,
+    "attempts": 1
   }
 }
