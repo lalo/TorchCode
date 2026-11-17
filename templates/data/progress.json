@@ -16,5 +16,11 @@
     "solved_at": "2026-11-17T11:00:38.954824",
     "best_time": 0.08278042002348229,
     "attempts": 1
+  },
+  "p04_indexing_masking": {
+    "status": "solved",
+    "attempts": 4,
+    "solved_at": "2026-11-17T13:45:36.107194",
+    "best_time": 0.02371328987646848
   }
 }
