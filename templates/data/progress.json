@@ -22,5 +22,11 @@
     "attempts": 4,
     "solved_at": "2026-11-17T13:45:36.107194",
     "best_time": 0.02371328987646848
+  },
+  "p05_shape_manipulation": {
+    "status": "solved",
+    "solved_at": "2026-11-17T16:19:47.340142",
+    "best_time": 0.0877197720692493,
+    "attempts": 1
   }
 }
