@@ -21,6 +21,7 @@ NOTEBOOK = {
         ('G', 'number of groups (`group_mean`)'),
         ('S', 'sequence length (tokens)'),
         ('D', 'feature dimension'),
+        ('N', 'number of `True` entries in a boolean mask (§3)'),
     ],
     "intro": r'''
 # 🔵 Prerequisite 4: Indexing & Masking
@@ -63,14 +64,24 @@ Inside `x[...]`, each entry addresses dimensions from the left:
 - **`...`** (Ellipsis) stands for **as many `:` as needed** (zero or more), so the entries after it address the **last** dimensions. At most one `...` per index.
 - **`None`** inserts a new size-1 dimension at that spot (P2).
 
+Think **coordinates**, not steps: every entry addresses one dimension of the **original** tensor, chosen by its **position between the commas**. `0` always means "the first one". Where you put it decides *which* dimension loses its axis:
+
+```python
+#    B  S  D
+x[   0, :, :]   # first sequence -> (S, D)
+x[   :, 0, :]   # first token    -> (B, D)   B kept, S picked, D kept (the trailing : is implied)
+x[   :, :, 0]   # first feature  -> (B, S)
+```
+
 With `x` of shape `(B, S, D)` (batch, tokens, features) these look alike but are not:
 
 | Index | Shape | Meaning |
 |-------|-------|---------|
 | `x[:, 0]` | `(B, D)` | the **first token** of every sequence |
 | `x[..., 0]` | `(B, S)` | the **first feature** of every token |
-| `x[0]`, `x[0, ...]` | `(S, D)` | the first sequence |
-| `x[..., None]` / `x[:, None]` | `(B, S, D, 1)` / `(B, 1, S, D)` | a new size-1 dim at the end / after dim 0 |
+| `x[0]` or `x[0, ...]` (same thing) | `(S, D)` | the first sequence: still `S` tokens of `D` numbers each |
+| `x[..., None]` | `(B, S, D, 1)` | a new size-1 dim at the end |
+| `x[:, None]` | `(B, 1, S, D)` | a new size-1 dim after dim 0 |
 
 Because `...` absorbs any number of leading dims, `x[..., 0::2]` (every other feature, as RoPE uses) works unchanged for `(S, D)` and `(B, H, S, D)`.
 
@@ -96,22 +107,44 @@ print(x[0, 0], x[0, 0].flip(0))       # [0, 1, 2, 3] -> [3, 2, 1, 0]
 
 Indexing with an integer **tensor** selects rows: `weight[indices]` is an embedding lookup, and works for any shape of `indices`.
 Indexing with **two** index tensors pairs them up element-wise: `x[rows, cols]` returns `x[rows[0], cols[0]], x[rows[1], cols[1]], …`. This is **not** the same as `x[rows][:, cols]`.
+
+- **One** index tensor: each number in it is **replaced by a whole row**. So the result has the index's shape, plus the row's shape at the end.
+- **Two** index tensors: each `(row, col)` **pair** picks a **single number**, like coordinates.
+
+Every index must exist in its dimension (`0 … size-1`, or negative from the end). One bad index anywhere raises an `IndexError` for the whole operation.
 '''),
         ("code", r'''
 weight = torch.arange(10.).view(5, 2)          # 5 embeddings of size 2
 idx = torch.tensor([[0, 4], [2, 2]])
 print(weight[idx].shape)                       # (2, 2, 2): idx shape + embedding dim
+print(weight[idx])                             # [[row 0, row 4], [row 2, row 2]]
 
 x = torch.tensor([[10., 11., 12.],
                   [20., 21., 22.]])
-print(x[torch.tensor([0, 1]), torch.tensor([2, 0])])   # tensor([12., 20.])
+print(x[torch.tensor([0, 1]), torch.tensor([2, 0])])   # tensor([12., 20.]): x[0, 2] and x[1, 0]
+try:
+    x[torch.tensor([0, 1]), torch.tensor([2, 3])]       # column 3 doesn't exist
+except IndexError as e:
+    print("IndexError:", e)
 '''),
         ("md", r'''
 ## 3. Boolean masks
 
 - **Reading** `x[mask]` returns a **1-D** tensor of the selected elements. The shape is lost.
 - **Writing** `x[mask] = value` (or `x[mask] += ...`) updates only the selected positions.
-- `torch.where(mask, a, b)` picks element-wise and **keeps the shape**.
+- `torch.where(mask, a, b)` picks element-wise and **keeps the shape**. It returns a new tensor; there is no `where_`. To replace in place, use `x.masked_fill_(mask, v)` or `x[mask] = v`.
+
+Two separate steps happen in `x[x < 0]`. First, `x < 0` compares **every** number, so the mask has the **same shape as `x`**. No indexing has happened yet. Then `x[mask]` **filters and collects** the numbers marked `True`. The result is 1-D because rows can have different numbers of matches, and those can't form a rectangle without inventing padding.
+
+A boolean mask is **not** a single index slot like `0` or `:`. **It covers as many dimensions as it has**, starting where you put it. For `x` of shape `(B, S, D)` and `N` = the number of `True`s:
+
+| Mask shape | Each `True` keeps | `x[mask]` shape |
+|------------|-------------------|-----------------|
+| `(B,)` | a whole sequence | `(N, S, D)` |
+| `(B, S)` | one token's feature vector | `(N, D)` |
+| `(B, S, D)`, e.g. `x < 0` | one number | `(N,)` |
+
+The rule: **`(N,)` + whatever dimensions the mask doesn't cover.** A mask must line up with the dimensions it covers; it does **not** broadcast. A `(S, S)` mask on a `(B, S, S)` tensor needs `y[..., mask]`, and plain `y[mask]` raises an error. `masked_fill` and `torch.where` **do** broadcast (§4).
 '''),
         ("code", r'''
 x = torch.tensor([[1., -2.], [-3., 4.]])
@@ -119,6 +152,23 @@ mask = x < 0
 print(x[mask])                        # tensor([-2., -3.]): flattened
 print(torch.where(mask, 0.0, x))      # same shape, negatives replaced
 y = x.clone(); y[mask] = 0.0; print(y)
+
+x = torch.tensor([[[10, 11], [12, 13], [14, 15]],       # (B=2, S=3, D=2)
+                  [[20, 21], [22, 23], [24, 25]]])
+print(x[torch.tensor([True, False])].shape)            # mask (B,): torch.Size([1, 3, 2]), all of sequence 0
+mask_BS = torch.tensor([[True, False, True],
+                        [False, True, False]])
+print(x[mask_BS])                                      # mask (B, S): 3 whole tokens -> (3, 2)
+print(x[x > 20])                                       # mask (B, S, D): single numbers -> 1-D
+
+scores = torch.zeros(2, 3, 3)                          # (B, S, S)
+future = torch.ones(3, 3, dtype=torch.bool).triu(1)    # (S, S)
+try:
+    scores[future] = -1.0                              # boolean indexing does not broadcast
+except IndexError as e:
+    print("IndexError:", str(e)[:70])
+scores[..., future] = -1.0                             # ... skips B, the mask covers the last two dims
+print(scores[0])
 '''),
         ("md", r'''
 ## 4. `masked_fill` and building masks
@@ -166,6 +216,10 @@ print(s_vals, s_idx)
 - `x.scatter(dim, idx, src)` **writes**: `out[i][idx[i][j]] = src[i][j]`. It returns a copy of `x` with those positions overwritten (`scatter_` is the in-place version).
 
 They are inverses: `gather` pulls values *from* positions, `scatter` pushes values *to* positions.
+
+The first argument is **`dim`**: which dimension the **values** in `idx` point into. With `dim=1` on a 2-D tensor, the **row** comes from *where* a number sits in `idx`, and the **column** comes from the number *itself*.
+
+> ⚠️ Use the same `dim` the indices came from. Indices from `x.sort(dim=-1)` or `x.topk(k, dim=-1)` are **column** positions, so `scatter(-1, ...)`. With `scatter(0, ...)` they would be read as row numbers, and you get errors like *index 7 is out of bounds for dimension 0 with size 3*.
 '''),
         ("code", r'''
 x = torch.tensor([[10., 11., 12.],
@@ -189,6 +243,11 @@ GRPO (#38) normalizes each reward against the other rewards **from the same prom
 - `group_stat[inverse]` broadcasts a per-group result back to every element.
 
 No loop over groups needed, no matter how many there are.
+
+The cell below is **one pipeline**, not a list of alternatives: relabel → count → sum → divide → expand back. Two details:
+
+- `bincount` counts **any** non-negative integers, and the output has one slot for every value from `0` up to the largest: `bincount([3, 3, 5])` is `[0, 0, 0, 2, 0, 1]`. That's why you count `inv` (compact `0 … G-1`), not the raw ids. With ids like `1000` you'd get mostly empty slots. (`ids.unique(return_inverse=True, return_counts=True)` gives the counts in the same call.)
+- The last step, `(sums / counts)[inv]`, is the integer indexing from §2. It doesn't reorder; it **expands** `G` group means into one mean per element.
 '''),
         ("code", r'''
 ids = torch.tensor([7, 3, 7, 10, 3])
@@ -199,6 +258,7 @@ counts = torch.bincount(inv)
 sums = torch.zeros(len(uniq)).index_add(0, inv, vals)
 print(counts, sums)                               # [2, 2, 1]  [7., 4., 4.]
 print((sums / counts)[inv])                       # each element's group mean: [2., 3.5, 2., 4., 3.5]
+print(torch.bincount(torch.tensor([3, 3, 5])))    # tensor([0, 0, 0, 2, 0, 1]): slot = value, entry = how often
 '''),
         ("md", r'''
 ## 8. More selection tools
@@ -233,7 +293,7 @@ print(slots)                                                  # [3., 0., 5.]: bo
 |------|------------------|---------------|
 | One value per row | `x[torch.arange(B), idx]`, `x.gather(1, idx[:, None]).squeeze(1)`, `torch.take_along_dim(x, idx[:, None], 1).squeeze(1)`, `(F.one_hot(idx, C) * x).sum(1)` | the one-hot form builds a full `(B, C)` tensor: wasteful for large vocabularies |
 | Sums per group | `zeros(G).index_add(0, inv, v)`, `zeros(G).scatter_add(0, inv, v)`, `torch.bincount(inv, weights=v)` | `bincount` has **no gradient**; on GPU, `index_add`/`scatter_add` use atomic adds, so float results can differ slightly run to run |
-| Replace where a condition holds | `x.masked_fill(mask, v)`, `torch.where(mask, v, x)`, `x.clone(); y[mask] = v` | the last one is in place on a copy: fine, but easy to forget the `clone()` |
+| Replace where a condition holds | `x.masked_fill(mask, v)`, `torch.where(mask, v, x)`, `y = x.clone(); y[mask] = v` | the last one is in place on a copy: fine, but easy to forget the `clone()`. It also doesn't broadcast: a `(S, S)` mask on `(B, S, S)` needs `y[..., mask] = v` |
 | Sample from probabilities | `torch.multinomial(p, n)`, `torch.searchsorted(p.cumsum(0), torch.rand(n))` | `multinomial` handles rounding at the top end of the CDF; with `searchsorted`, clamp to `len(p) - 1` |
 '''),
         ("code", r'''
@@ -296,7 +356,7 @@ Build an `(n, n)` **boolean** mask for attention, where `True` means **blocked**
 - `kind="causal_sliding"`: causal window (Mistral-style), block `j > i` **or** `i - j > w`
 - any other `kind`: raise `ValueError`
 
-*Hint: P2's `relative_position(n)` (`R[i, j] = i - j`) makes each kind a single comparison.*
+*Hint: P2's `relative_position(n)` (`R[i, j] = i - j`) makes each kind a single comparison. Rows are queries `i` (`arange(n)[:, None]`, shape `(n, 1)`), columns are keys `j` (`arange(n)[None, :]`, shape `(1, n)`), and comparing the two broadcasts to `(n, n)`.*
 ''',
             "stub": r'''
 def attention_mask(n: int, kind: str, w: int = 0) -> torch.Tensor:
@@ -358,6 +418,8 @@ Keep the `k` largest logits in each row (last dim) and set every other entry to 
 - `k`: int, `1 <= k`; if `k >= V`, keep everything
 - returns: same shape; kept entries **unchanged**, others `-inf`
 - do **not** modify `logits` in place
+
+*Hint: `topk` gives you the values **and** where they came from (§5). Instead of removing the losers, think about starting from all `-inf` and writing the winners back to their positions (§6).*
 
 *#32 samples only from the top-k tokens; #28 MoE routes each token to its top-k experts.*
 ''',
