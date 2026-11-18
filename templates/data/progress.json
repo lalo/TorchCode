@@ -34,5 +34,11 @@
     "attempts": 2,
     "solved_at": "2026-11-17T17:25:11.434639",
     "best_time": 0.01910857792245224
+  },
+  "p07_autograd": {
+    "status": "solved",
+    "attempts": 3,
+    "solved_at": "2026-11-18T11:40:41.043277",
+    "best_time": 0.01108455698704347
   }
 }
