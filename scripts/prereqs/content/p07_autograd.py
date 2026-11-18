@@ -49,6 +49,8 @@ The classic bugs are silent: gradients that accumulate across steps, a parameter
 
 A tensor you create with `requires_grad=True` is a **leaf**. Every operation on it records a node in a graph. Calling `.backward()` on a **scalar** result fills `.grad` on the **leaves**.
 Intermediate (non-leaf) tensors don't keep `.grad` unless you ask with `.retain_grad()`.
+
+`x.requires_grad` only **reads** the flag. To turn tracking on for an existing tensor, call `x.requires_grad_(True)` (the trailing `_` means in place, P1).
 '''),
         ("code", r'''
 w = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
@@ -58,6 +60,10 @@ loss.backward()
 print(w.is_leaf, y.is_leaf)        # True False
 print(w.grad)                      # tensor([2., 4., 6.]) = d(sum w^2)/dw
 print(y.grad)                      # None (with a warning): non-leaf
+
+c = torch.tensor([1.0, 2.0])
+c.requires_grad                    # reads the flag (False), changes nothing
+print(c.requires_grad_(True).requires_grad)   # True: now it's a leaf that tracks gradients
 '''),
         ("md", r'''
 ## 2. ⚠️ Gradients accumulate
@@ -77,6 +83,8 @@ w.grad = None              # or w.grad.zero_()
 
 Updating a parameter in place (`w -= lr * w.grad`) must **not** be recorded in the graph. PyTorch refuses in-place ops on a leaf that requires grad unless you wrap them in `torch.no_grad()`.
 Weight initialization (`weight.normal_(...)` in #20) and running-stat updates (#07) use the same pattern.
+
+**Why in place?** `w -= lr * w.grad` changes the values of the **same tensor object**. That matters because a model and its optimizer hold references to their parameters. The out-of-place version, `w = w - lr * w.grad`, builds a **new** tensor and points the name `w` at it. The model and optimizer still hold the old one, and the new one is a non-leaf with a `grad_fn`, so it's no longer a trainable parameter. In real code `optimizer.step()` does exactly this in-place update for you; writing it by hand shows why it runs under `no_grad()`.
 '''),
         ("code", r'''
 w = torch.tensor([1.0, 2.0], requires_grad=True)
@@ -88,6 +96,10 @@ except RuntimeError as e:
 with torch.no_grad():
     w -= 0.1 * w.grad
 print(w, w.is_leaf, w.requires_grad)   # still a trainable leaf
+
+params = [w]                           # what an optimizer holds on to
+w = w - 0.1 * w.grad                   # out of place: a NEW tensor, recorded in the graph
+print(w.is_leaf, w.grad_fn is not None, params[0] is w)   # False True False: the optimizer still has the old one
 '''),
         ("md", r'''
 ## 4. `detach()` as a stop-gradient
@@ -96,6 +108,8 @@ print(w, w.is_leaf, w.requires_grad)   # still a trainable leaf
 Use it whenever a quantity must not be trained through: regression targets, PPO's old log-probs, GRPO's advantages, a teacher's logits, BatchNorm's running stats.
 
 A useful trick: `x + (f(x) - x).detach()` has the *value* of `f(x)` but the *gradient* of `x`. This is the **straight-through estimator**.
+
+`detach()` doesn't copy: the result **shares memory** with `x` (§7). Use `x.detach().clone()` for an independent copy.
 '''),
         ("code", r'''
 x = torch.tensor([2.0], requires_grad=True)
@@ -104,13 +118,38 @@ b = (x * x.detach()).sum()         # second factor is a constant: d/dx = x = 2
 print(torch.autograd.grad(a, x)[0], torch.autograd.grad(b, x)[0])   # tensor([4.]) tensor([2.])
 '''),
         ("md", r'''
+### The straight-through trick, with numbers
+
+Take `f = torch.round`. It's flat between its jumps (everything near `1.7` rounds to `2`), so its gradient is `0`. By the chain rule, gradients **multiply** along a path, so a `0` there wipes out every gradient behind it. Nothing before the rounding could learn.
+
+| | `x = [0.2, 1.7, -2.6]` |
+|---|---|
+| `torch.round(x)` | `[0, 2, -3]` |
+| correction `torch.round(x) - x`, detached | `[-0.2, 0.3, -0.4]` |
+| forward: `x + correction` | `[0, 2, -3]`: the rounded values |
+| backward | the correction is a constant, so `d out / d x = 1`: as if `out = x` |
+
+The forward pass really is rounded; only the backward pass **pretends** rounding was the identity. With a gradient of `1`, the gradient arriving from later layers passes through **unchanged**: it is all ones only when the loss is a plain `sum`. That approximation lets quantization-aware training (#36) nudge `1.7` toward `1.5` until it starts rounding to `1`.
+'''),
+        ("code", r'''
+x = torch.tensor([0.2, 1.7, -2.6], requires_grad=True)
+torch.round(x).sum().backward()
+print(x.grad)                                       # tensor([0., 0., 0.]): no learning signal
+x.grad = None
+correction = (torch.round(x) - x).detach()
+print(correction)                                   # tensor([-0.2000,  0.3000, -0.4000])
+out = x + correction
+(out * torch.tensor([1., 2., 3.])).sum().backward()  # a loss that sends back [1, 2, 3]
+print(out, x.grad)                                  # rounded values; gradient [1, 2, 3] passed through
+'''),
+        ("md", r'''
 ## 5. `torch.autograd.grad`
 
 `torch.autograd.grad(output, inputs)` returns the gradients as a tuple **without** writing to `.grad`. It's handy for checking a gradient you derived by hand, or for gradients of gradients.
 '''),
         ("code", r'''
 x = torch.tensor([1.0, -2.0], requires_grad=True)
-(g,) = torch.autograd.grad((x ** 3).sum(), x)
+(g,) = torch.autograd.grad((x ** 3).sum(), x)   # returns a tuple, one gradient per input
 print(g, x.grad)          # tensor([3., 12.]) None: .grad untouched
 '''),
         ("md", r'''
@@ -207,7 +246,7 @@ print(grad_of(lambda t: (t ** 2).sum(), x))   # expect tensor([ 2., -4.,  6.])
 
 One step of plain gradient descent, then clear the gradients, as `optimizer.step()` followed by `optimizer.zero_grad()` would.
 
-- `params`: a list of leaf tensors with `requires_grad=True`; some may have `.grad is None` (skip those)
+- `params`: a list of leaf tensors with `requires_grad=True`. ⚠️ Some may have `.grad is None`: a parameter the loss didn't use never gets a gradient, and `None * lr` raises a `TypeError`. Skip those.
 - `lr`: float
 - update each parameter **in place**: `p ← p - lr * p.grad`
 - afterwards every parameter must still be a leaf with `requires_grad=True`, and its `.grad` must be `None` or all zeros
@@ -272,7 +311,15 @@ Gradient accumulation: compute the gradient of the **average** loss over several
 - loss of one micro-batch: `mean((x @ w - y) ** 2)`
 - returns: `w.grad`, which must equal the gradient of the mean of the micro-batch losses
 
-*Two things to get right: clear the old gradient first, and scale each micro-batch loss. This is #31.*
+The loss is fixed (the formula above), so it isn't a parameter: build it from each `(x, y)` yourself. In the debug cell, `full = grad_of(...)` is only a **check** that computes the same gradient on all the data at once.
+
+*Hints:*
+- *Gradients need to be recorded here, so no `torch.no_grad()`.*
+- *Call `.backward()` on each micro-batch's scalar **loss**, not on `w`. It returns `None`; the gradient lands in `w.grad`.*
+- *Clear the old gradient first: `.backward()` **adds** to whatever is in `w.grad` (§2). The debug cell starts fresh, but the tests don't.*
+- *Scale each micro-batch loss: without it, the accumulated gradient is the gradient of the **sum** of the losses, not their mean.*
+
+*This is #31.*
 ''',
             "stub": r'''
 def accumulate_grads(w: torch.Tensor, batches: list[tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
